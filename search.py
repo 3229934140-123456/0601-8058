@@ -146,11 +146,12 @@ class QueryParser:
             if field_match:
                 field_name = field_match.group(1)
                 field_value = field_match.group(2)
-                tokens = self.tokenizer.tokenize_query(field_value)
                 if field_name == "site":
-                    site_terms.extend(tokens)
-                elif field_name in field_terms:
-                    field_terms[field_name].extend(tokens)
+                    site_terms.append(field_value.lower())
+                else:
+                    tokens = self.tokenizer.tokenize_query(field_value)
+                    if field_name in field_terms:
+                        field_terms[field_name].extend(tokens)
                 continue
 
             if part.startswith("+"):
@@ -282,7 +283,7 @@ class SearchEngine:
         self.scorer = scorer or BM25FieldScorer(self.index)
         self.query_parser = QueryParser(tokenizer=self.tokenizer)
 
-    def search(self, query_string, top_k=10):
+    def search(self, query_string, top_k=10, sort_mode="combined"):
         parsed = self.query_parser.parse(query_string)
 
         must_terms = list(dict.fromkeys(parsed.must_terms))
@@ -405,6 +406,15 @@ class SearchEngine:
             total_score = base_score + phrase_score + proximity_bonus + must_boost
             breakdown.total = total_score
 
+            if sort_mode == "title_only":
+                sort_score = breakdown.bm25_title + phrase_score * 0.3
+            elif sort_mode == "body_only":
+                sort_score = breakdown.bm25_body + phrase_score + proximity_bonus * 0.5
+            elif sort_mode == "url_only":
+                sort_score = breakdown.bm25_url
+            else:
+                sort_score = total_score
+
             term_freqs = {}
             for term in all_terms:
                 tf = self.index.get_term_freq(term, doc_id, "body")
@@ -413,7 +423,7 @@ class SearchEngine:
                 if tf > 0 or ttf > 0 or utf > 0:
                     term_freqs[term] = {"body": tf, "title": ttf, "url": utf}
 
-            if total_score > 0:
+            if sort_score > 0 or total_score > 0:
                 snippets = {}
                 for term in all_terms:
                     positions = self.index.get_positions(term, doc_id)
@@ -422,23 +432,24 @@ class SearchEngine:
 
                 highlights = _extract_snippets(doc.text, all_terms)
 
-                results.append(
-                    SearchResult(
-                        doc_id=doc_id,
-                        url=doc.url,
-                        title=doc.title,
-                        score=total_score,
-                        snippets=snippets,
-                        term_freqs=term_freqs,
-                        doc_length=doc.length,
-                        phrase_matches=phrase_matches,
-                        highlights=highlights,
-                        field_hits=field_hit_info,
-                        score_breakdown=breakdown,
-                    )
+                res = SearchResult(
+                    doc_id=doc_id,
+                    url=doc.url,
+                    title=doc.title,
+                    score=total_score,
+                    snippets=snippets,
+                    term_freqs=term_freqs,
+                    doc_length=doc.length,
+                    phrase_matches=phrase_matches,
+                    highlights=highlights,
+                    field_hits=field_hit_info,
+                    score_breakdown=breakdown,
                 )
+                res.sort_score = sort_score
+                res.sort_mode = sort_mode
+                results.append(res)
 
-        results.sort(key=lambda r: r.score, reverse=True)
+        results.sort(key=lambda r: r.sort_score, reverse=True)
         return results[:top_k]
 
     def add_document(self, url, title, text):
@@ -452,10 +463,25 @@ class SearchEngine:
         return self.index.create_snapshot(label)
 
     def rollback_snapshot(self, snapshot_id):
-        return self.index.rollback_snapshot(snapshot_id)
+        ok = self.index.rollback_snapshot(snapshot_id)
+        if ok:
+            self.scorer = BM25FieldScorer(self.index)
+        return ok
 
     def list_snapshots(self):
         return self.index.list_snapshots()
+
+    def delete_snapshot(self, snapshot_id):
+        return self.index.delete_snapshot(snapshot_id)
+
+    def set_snapshot_dir(self, directory):
+        self.index.set_snapshot_dir(directory)
+
+    def export_snapshot(self, snapshot_id, output_path):
+        return self.index.export_snapshot(snapshot_id, output_path)
+
+    def import_snapshot(self, input_path, label=None):
+        return self.index.import_snapshot(input_path, label)
 
     def save_index(self, directory):
         self.index.save(directory)

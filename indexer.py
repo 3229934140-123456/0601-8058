@@ -4,7 +4,9 @@ import hashlib
 import time
 import copy
 import logging
+import re
 from collections import defaultdict, Counter
+from urllib.parse import urlparse
 
 from tokenizer import Tokenizer
 
@@ -76,6 +78,32 @@ class Document:
 
 def _content_hash(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def extract_domain(url):
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme:
+            return parsed.hostname or ""
+        if "/" in url:
+            url = url.split("/")[0]
+        return url.lower()
+    except Exception:
+        return ""
+
+
+def domain_matches(domain, pattern):
+    if not domain or not pattern:
+        return False
+    domain = domain.lower()
+    pattern = pattern.lower()
+    if domain == pattern:
+        return True
+    if domain.endswith("." + pattern):
+        return True
+    return False
 
 
 class InvertedIndex:
@@ -305,22 +333,79 @@ class InvertedIndex:
         if not site_terms:
             return doc_ids if doc_ids is not None else set()
 
-        url_docs = self.union_postings(site_terms, field="url")
-
         if doc_ids is None:
-            return url_docs
-        return doc_ids & url_docs
+            doc_ids = set(self.documents.keys())
 
-    def create_snapshot(self, label=""):
-        snapshot = {
-            "id": len(self._snapshots),
-            "timestamp": time.time(),
-            "label": label,
+        matched = set()
+        for doc_id in doc_ids:
+            doc = self.documents.get(doc_id)
+            if doc is None:
+                continue
+            domain = extract_domain(doc.url)
+            for site_term in site_terms:
+                if domain_matches(domain, site_term):
+                    matched.add(doc_id)
+                    break
+        return matched
+
+    def set_snapshot_dir(self, directory):
+        self._snapshot_dir = directory
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+            self._scan_snapshots()
+
+    def _snapshot_filename(self, snap_id, timestamp):
+        ts = int(timestamp)
+        return f"snapshot_{snap_id:04d}_{ts}.json"
+
+    def _scan_snapshots(self):
+        if not self._snapshot_dir or not os.path.isdir(self._snapshot_dir):
+            return
+        pattern = re.compile(r"^snapshot_(\d+)_(\d+)\.json$")
+        files = []
+        for fname in os.listdir(self._snapshot_dir):
+            m = pattern.match(fname)
+            if m:
+                files.append((int(m.group(1)), int(m.group(2)), fname))
+        files.sort(key=lambda x: x[0])
+
+        self._snapshots = []
+        for snap_id, ts, fname in files:
+            fpath = os.path.join(self._snapshot_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                self._snapshots.append({
+                    "id": snap_id,
+                    "timestamp": ts,
+                    "label": meta.get("label", ""),
+                    "doc_count": meta.get("doc_count", 0),
+                    "term_count": meta.get("term_count", 0),
+                    "filename": fname,
+                    "from_file": True,
+                })
+            except Exception:
+                logger.warning("Failed to load snapshot %s", fname)
+
+        if self._snapshots:
+            self._next_snapshot_id = self._snapshots[-1]["id"] + 1
+        else:
+            self._next_snapshot_id = 0
+
+    def _snapshot_to_dict(self):
+        return {
+            "label": "",
             "doc_count": self.doc_count,
             "term_count": self.term_count,
             "data": {
-                "field_postings": copy.deepcopy(dict(self.field_postings)),
-                "documents": {k: v.to_dict() for k, v in self.documents.items()},
+                "field_postings": {
+                    field: {
+                        term: {str(did): pos for did, pos in doc_map.items()}
+                        for term, doc_map in postings.items()
+                    }
+                    for field, postings in self.field_postings.items()
+                },
+                "documents": {str(k): v.to_dict() for k, v in self.documents.items()},
                 "next_id": self._next_id,
                 "url_to_id": dict(self._url_to_id),
                 "field_total_length": dict(self._field_total_length),
@@ -328,26 +413,110 @@ class InvertedIndex:
                 "last_updated": self._last_updated,
             },
         }
-        self._snapshots.append(snapshot)
-        logger.info("Created snapshot %d: %s (%d docs)", snapshot["id"], label or "auto", self.doc_count)
-        return snapshot["id"]
 
-    def rollback_snapshot(self, snapshot_id):
-        if snapshot_id < 0 or snapshot_id >= len(self._snapshots):
+    def _load_snapshot_data(self, snap_id):
+        snap = None
+        for s in self._snapshots:
+            if s["id"] == snap_id:
+                snap = s
+                break
+        if snap is None:
+            return None
+
+        if "data" in snap:
+            return snap["data"]
+
+        if self._snapshot_dir and snap.get("from_file") and snap.get("filename"):
+            fpath = os.path.join(self._snapshot_dir, snap["filename"])
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    sd = json.load(f)
+                return sd.get("data")
+            except Exception:
+                logger.warning("Failed to load snapshot file %s", fpath)
+        return None
+
+    def create_snapshot(self, label=""):
+        snap_id = self._next_snapshot_id
+        timestamp = time.time()
+
+        snapshot = {
+            "id": snap_id,
+            "timestamp": timestamp,
+            "label": label,
+            "doc_count": self.doc_count,
+            "term_count": self.term_count,
+        }
+
+        if self._snapshot_dir:
+            snap_data = self._snapshot_to_dict()
+            snap_data["label"] = label
+            fname = self._snapshot_filename(snap_id, timestamp)
+            fpath = os.path.join(self._snapshot_dir, fname)
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(snap_data, f, ensure_ascii=False)
+                snapshot["filename"] = fname
+                snapshot["from_file"] = True
+            except Exception:
+                logger.error("Failed to save snapshot to %s", fpath)
+        else:
+            snapshot["data"] = self._snapshot_to_dict()["data"]
+
+        self._snapshots.append(snapshot)
+        self._next_snapshot_id += 1
+
+        logger.info("Created snapshot %d: %s (%d docs)", snap_id, label or "auto", self.doc_count)
+        return snap_id
+
+    def delete_snapshot(self, snapshot_id):
+        idx = None
+        for i, s in enumerate(self._snapshots):
+            if s["id"] == snapshot_id:
+                idx = i
+                break
+        if idx is None:
             return False
 
-        snap = self._snapshots[snapshot_id]
-        data = snap["data"]
+        snap = self._snapshots[idx]
+        if self._snapshot_dir and snap.get("filename"):
+            fpath = os.path.join(self._snapshot_dir, snap["filename"])
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+            except Exception:
+                logger.warning("Failed to delete snapshot file %s", fpath)
+
+        del self._snapshots[idx]
+        logger.info("Deleted snapshot %d", snapshot_id)
+        return True
+
+    def rollback_snapshot(self, snapshot_id):
+        data = self._load_snapshot_data(snapshot_id)
+        if data is None:
+            return False
+
+        idx = None
+        for i, s in enumerate(self._snapshots):
+            if s["id"] == snapshot_id:
+                idx = i
+                break
+        if idx is None:
+            return False
+        snap = self._snapshots[idx]
 
         self.field_postings = {}
-        for field, postings in data["field_postings"].items():
+        for field in ["title", "body", "url"]:
             self.field_postings[field] = defaultdict(lambda: defaultdict(list))
+        for field, postings in data.get("field_postings", {}).items():
+            if field not in self.field_postings:
+                continue
             for term, doc_map in postings.items():
-                for doc_id, positions in doc_map.items():
-                    self.field_postings[field][term][int(doc_id)] = list(positions)
+                for doc_id_str, positions in doc_map.items():
+                    self.field_postings[field][term][int(doc_id_str)] = list(positions)
 
         self.documents = {}
-        for doc_id_str, doc_dict in data["documents"].items():
+        for doc_id_str, doc_dict in data.get("documents", {}).items():
             self.documents[int(doc_id_str)] = Document.from_dict(doc_dict)
 
         self._next_id = data["next_id"]
@@ -356,13 +525,94 @@ class InvertedIndex:
         self._corpus_length = data["corpus_length"]
         self._last_updated = data["last_updated"]
 
-        self._snapshots = self._snapshots[:snapshot_id]
+        self._snapshots = self._snapshots[: idx + 1]
+        self._next_snapshot_id = snapshot_id + 1
 
         logger.info(
             "Rolled back to snapshot %d (%s), %d docs",
-            snapshot_id, snap["label"] or "auto", self.doc_count,
+            snapshot_id, snap.get("label") or "auto", self.doc_count,
         )
         return True
+
+    def export_snapshot(self, snapshot_id, output_path):
+        data = self._load_snapshot_data(snapshot_id)
+        if data is None:
+            return False
+        snap = None
+        for s in self._snapshots:
+            if s["id"] == snapshot_id:
+                snap = s
+                break
+
+        export_data = {
+            "version": 1,
+            "snapshot_id": snapshot_id,
+            "label": snap.get("label", "") if snap else "",
+            "timestamp": snap.get("timestamp", time.time()) if snap else time.time(),
+            "doc_count": snap.get("doc_count", self.doc_count) if snap else self.doc_count,
+            "term_count": snap.get("term_count", self.term_count) if snap else self.term_count,
+            "data": data,
+        }
+
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error("Failed to export snapshot: %s", e)
+            return False
+
+    def import_snapshot(self, input_path, label=None):
+        try:
+            with open(input_path, "r", encoding="utf-8") as f:
+                sd = json.load(f)
+        except Exception as e:
+            logger.error("Failed to import snapshot: %s", e)
+            return None
+
+        if "data" not in sd:
+            logger.error("Invalid snapshot file: missing data")
+            return None
+
+        snap_id = self._next_snapshot_id
+        timestamp = sd.get("timestamp", time.time())
+        doc_count = sd.get("doc_count", 0)
+        term_count = sd.get("term_count", 0)
+        snap_label = label if label is not None else sd.get("label", "imported")
+
+        snapshot = {
+            "id": snap_id,
+            "timestamp": timestamp,
+            "label": snap_label,
+            "doc_count": doc_count,
+            "term_count": term_count,
+        }
+
+        if self._snapshot_dir:
+            fname = self._snapshot_filename(snap_id, timestamp)
+            fpath = os.path.join(self._snapshot_dir, fname)
+            export_data = {
+                "label": snap_label,
+                "doc_count": doc_count,
+                "term_count": term_count,
+                "data": sd["data"],
+            }
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(export_data, f, ensure_ascii=False)
+                snapshot["filename"] = fname
+                snapshot["from_file"] = True
+            except Exception:
+                logger.error("Failed to save imported snapshot to %s", fpath)
+                snapshot["data"] = sd["data"]
+        else:
+            snapshot["data"] = sd["data"]
+
+        self._snapshots.append(snapshot)
+        self._next_snapshot_id += 1
+
+        logger.info("Imported snapshot %d: %s", snap_id, snap_label)
+        return snap_id
 
     def list_snapshots(self):
         return [

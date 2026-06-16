@@ -19,6 +19,51 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 INDEX_DIR = os.path.join(DATA_DIR, "index")
 PAGES_FILE = os.path.join(DATA_DIR, "pages.json")
 CRAWL_CACHE_FILE = os.path.join(DATA_DIR, "crawl_cache.json")
+SNAPSHOT_DIR = os.path.join(DATA_DIR, "snapshots")
+QUERY_HISTORY_FILE = os.path.join(DATA_DIR, "query_history.json")
+MAX_QUERY_HISTORY = 20
+
+
+def load_query_history():
+    if not os.path.exists(QUERY_HISTORY_FILE):
+        return []
+    try:
+        with open(QUERY_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_query_history(history):
+    try:
+        os.makedirs(os.path.dirname(QUERY_HISTORY_FILE), exist_ok=True)
+        with open(QUERY_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def record_query(query_str, result_count, sort_mode="combined", history=None):
+    if not query_str.strip():
+        return
+    if history is None:
+        history = load_query_history()
+    entry = {
+        "query": query_str,
+        "timestamp": time.time(),
+        "result_count": result_count,
+        "sort_mode": sort_mode,
+        "has_results": result_count > 0,
+    }
+    for i, h in enumerate(history):
+        if h["query"] == query_str and h.get("sort_mode", "combined") == sort_mode:
+            del history[i]
+            break
+    history.insert(0, entry)
+    if len(history) > MAX_QUERY_HISTORY:
+        history.pop()
+    save_query_history(history)
+    return history
 
 
 def crawl_command(args):
@@ -66,6 +111,9 @@ def index_command(args, pages=None):
     engine = SearchEngine()
     if os.path.exists(INDEX_DIR):
         engine.load_index(INDEX_DIR)
+
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    engine.set_snapshot_dir(SNAPSHOT_DIR)
 
     if pages is None:
         if not os.path.exists(PAGES_FILE):
@@ -116,6 +164,7 @@ def search_command(args):
 
     query = " ".join(args.query)
     results = engine.search(query, top_k=args.top_k)
+    record_query(query, len(results))
 
     if not results:
         print(f"\nNo results found for: {query}")
@@ -277,6 +326,34 @@ def demo_command(args):
                 "This is a rare and specialized topic in computer science research."
             ),
         },
+        {
+            "url": "https://other.com/python-intro",
+            "title": "Python Introduction Guide",
+            "text": (
+                "Python is a versatile programming language used across many domains. "
+                "This introduction to Python covers basic syntax and common patterns. "
+                "Python's design philosophy emphasizes code readability."
+            ),
+        },
+        {
+            "url": "https://wiki.example.com/data-mining",
+            "title": "Data Mining Techniques Wiki",
+            "text": (
+                "Data mining is the process of discovering patterns in large data sets. "
+                "It involves methods at the intersection of machine learning, statistics, "
+                "and database systems. Data mining tasks include classification, clustering, "
+                "and association rule learning."
+            ),
+        },
+        {
+            "url": "https://blog.other.dev/search-tips",
+            "title": "Advanced Search Tips and Tricks",
+            "text": (
+                "Mastering advanced search techniques can improve your research efficiency. "
+                "Learn how to use field search, phrase queries, and boolean operators. "
+                "Search engines support many advanced features beyond simple keywords."
+            ),
+        },
     ]
 
     class _Page:
@@ -408,7 +485,7 @@ def demo_command(args):
 
 
 def serve_command(args):
-    from flask import Flask, render_template_string, request, jsonify
+    from flask import Flask, render_template_string, request, jsonify, send_file, send_from_directory
 
     app = Flask(__name__)
 
@@ -417,6 +494,15 @@ def serve_command(args):
         engine.load_index(INDEX_DIR)
     else:
         logger.warning("No index found at %s. Run 'index' or 'demo' first.", INDEX_DIR)
+
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    engine.set_snapshot_dir(SNAPSHOT_DIR)
+
+    query_history = load_query_history()
+
+    def _record_query(query_str, result_count, sort_mode="combined"):
+        nonlocal query_history
+        query_history = record_query(query_str, result_count, sort_mode, query_history)
 
     def _format_overview(overview):
         ov = dict(overview)
@@ -454,6 +540,25 @@ h1 { text-align: center; font-size: 2em; margin-bottom: 20px; color: #1a73e8; }
 .snapshot-tag:hover { background: #d2e3fc; }
 .snapshot-tag.rollback { background: #fce8e6; color: #d93025; }
 .snapshot-tag.rollback:hover { background: #fad2cf; }
+.snapshot-tag.export { background: #e6f4ea; color: #137333; padding: 6px 8px; }
+.snapshot-tag.export:hover { background: #ceead6; }
+.snapshot-tag.delete { background: #f1f3f4; color: #5f6368; padding: 6px 8px; }
+.snapshot-tag.delete:hover { background: #dadce0; }
+.snapshot-tag.no-result { background: #fce8e6; color: #d93025; }
+
+.btn-small { background: #1a73e8; color: white; border: none; padding: 6px 12px;
+             border-radius: 6px; cursor: pointer; font-size: 12px; }
+.btn-small:hover { background: #1557b0; }
+.btn-small.secondary { background: #f1f3f4; color: #333; }
+.btn-small.secondary:hover { background: #e8eaed; }
+
+.sort-panel { background: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px;
+              display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sort-label { font-size: 13px; color: #666; margin-right: 4px; }
+.sort-btn { background: #f1f3f4; color: #333; border: none; padding: 6px 14px;
+            border-radius: 16px; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+.sort-btn:hover { background: #e8eaed; }
+.sort-btn.active { background: #1a73e8; color: white; }
 
 .search-box { display: flex; gap: 10px; margin-bottom: 16px; }
 .search-box input { flex: 1; padding: 12px 16px; font-size: 16px; border: 2px solid #ddd;
@@ -488,6 +593,11 @@ h1 { text-align: center; font-size: 2em; margin-bottom: 20px; color: #1a73e8; }
 .result-item:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
 .result-title { font-size: 17px; color: #1a73e8; margin-bottom: 4px; }
 .result-url { font-size: 12px; color: #006621; margin-bottom: 6px; font-family: monospace; }
+.domain-tag { background: #e6f4ea; color: #137333; padding: 2px 8px; border-radius: 10px;
+              font-size: 11px; margin-right: 6px; font-weight: bold; }
+.sort-info { color: #666; font-size: 13px; font-weight: normal; }
+.sort-info em { font-style: normal; background: #e8f0fe; color: #1a73e8; padding: 2px 8px;
+                border-radius: 10px; font-size: 11px; }
 
 .result-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .result-meta span { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
@@ -549,22 +659,69 @@ h1 { text-align: center; font-size: 2em; margin-bottom: 20px; color: #1a73e8; }
 
 {% if snapshots %}
 <div class="snapshots">
-  <h3>📸 Snapshots ({{ snapshots|length }}) — click to rollback</h3>
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+    <h3 style="margin:0;">📸 Snapshots ({{ snapshots|length }}) — click to rollback</h3>
+    <div>
+      <label class="btn-small secondary">
+        📥 Import
+        <input type="file" id="importFile" accept=".json" style="display:none;" onchange="importSnapshot(event)">
+      </label>
+      <button class="btn-small" onclick="createSnapshot()">📸 New</button>
+    </div>
+  </div>
   <div class="snapshot-list">
   {% for s in snapshots %}
     <span class="snapshot-tag rollback" onclick="rollback({{ s.id }})"
           title="Roll back to this version">
       #{{ s.id }} {{ s.label or 'auto' }} ({{ s.doc_count }} docs)
     </span>
+    <span class="snapshot-tag export" onclick="exportSnapshot({{ s.id }})"
+          title="Export this snapshot">
+      📤
+    </span>
+    <span class="snapshot-tag delete" onclick="deleteSnapshot({{ s.id }})"
+          title="Delete this snapshot">
+      ✕
+    </span>
   {% endfor %}
   </div>
 </div>
 {% endif %}
 
-<form class="search-box" method="get" action="/">
+{% if query_history %}
+<div class="snapshots" style="background:#fff8e1;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+    <h3 style="margin:0;">🕒 Recent Queries</h3>
+    <button class="btn-small secondary" onclick="clearHistory()">Clear</button>
+  </div>
+  <div class="snapshot-list">
+  {% for h in query_history %}
+    <span class="snapshot-tag {% if not h.has_results %}no-result{% endif %}"
+          data-query="{{ h.query }}" onclick="runQuery(this)"
+          title="{{ h.time_str }} — {{ h.result_count }} results">
+      {{ h.query }}
+      <small style="opacity:0.6; margin-left:4px;">({{ h.result_count }})</small>
+    </span>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<form class="search-box" method="get" action="/" id="searchForm">
 <input type="text" name="q" value="{{ query }}" placeholder="Search with +term, -term, title:word, site:domain, &quot;phrase&quot;..." autofocus>
+<input type="hidden" name="sort" id="sortInput" value="{{ sort_mode }}">
 <button type="submit">Search</button>
 </form>
+
+{% if query %}
+<div class="sort-panel">
+  <span class="sort-label">Sort by:</span>
+  <button class="sort-btn {% if sort_mode == 'combined' %}active{% endif %}" onclick="changeSort('combined')">Combined</button>
+  <button class="sort-btn {% if sort_mode == 'title_only' %}active{% endif %}" onclick="changeSort('title_only')">Title only</button>
+  <button class="sort-btn {% if sort_mode == 'body_only' %}active{% endif %}" onclick="changeSort('body_only')">Body BM25</button>
+  <button class="sort-btn {% if sort_mode == 'url_only' %}active{% endif %}" onclick="changeSort('url_only')">URL only</button>
+</div>
+{% endif %}
 
 <div class="help">
 <div class="title">💡 Query syntax:</div>
@@ -596,12 +753,19 @@ h1 { text-align: center; font-size: 2em; margin-bottom: 20px; color: #1a73e8; }
 </div>
 
 {% if query %}
-<p class="stats">Found {{ results|length }} result(s) for <strong>{{ query }}</strong></p>
+<p class="stats">Found {{ results|length }} result(s) for <strong>{{ query }}</strong>
+{% if sort_mode != 'combined' %}
+  <span class="sort-info">· sorted by <em>{{ sort_mode }}</em></span>
+{% endif %}
+</p>
 <div class="results">
 {% for r in results %}
 <div class="result-item" onclick="toggleBreakdown({{ r.doc_id }})">
 <div class="result-title">{{ r.title }}</div>
-<div class="result-url">{{ r.url }}</div>
+<div class="result-url">
+  <span class="domain-tag">{{ r.url.split('/')[2] if '://' in r.url else r.url.split('/')[0] }}</span>
+  {{ r.url }}
+</div>
 <div class="result-meta">
 <span class="meta-score">Score: {{ "%.4f"|format(r.score) }}</span>
 {% if 'title' in r.field_hits %}<span class="meta-title-hit">📌 Title hit</span>{% endif %}
@@ -727,6 +891,67 @@ document.getElementById('addForm').addEventListener('submit', async function(e) 
     setTimeout(() => location.reload(), 1200);
 });
 
+function changeSort(mode) {
+    const form = document.getElementById('searchForm');
+    document.getElementById('sortInput').value = mode;
+    form.submit();
+}
+
+function runQuery(el) {
+    const query = typeof el === 'string' ? el : el.getAttribute('data-query');
+    const form = document.getElementById('searchForm');
+    form.querySelector('input[name="q"]').value = query;
+    form.submit();
+}
+
+function exportSnapshot(id) {
+    window.location.href = '/api/index/snapshot/' + id + '/export';
+}
+
+function importSnapshot(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    const label = prompt('Snapshot label (optional):', '');
+    if (label) formData.append('label', label);
+    
+    fetch('/api/index/snapshot/import', {
+        method: 'POST',
+        body: formData
+    }).then(res => res.json()).then(result => {
+        if (result.status === 'ok') {
+            showToast('Snapshot imported! #' + result.snapshot_id);
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showToast('Import failed: ' + (result.error || 'unknown'), true);
+        }
+    }).catch(() => showToast('Import failed', true));
+    event.target.value = '';
+}
+
+function deleteSnapshot(id) {
+    if (!confirm('Delete snapshot #' + id + '?')) return;
+    fetch('/api/index/snapshot/' + id, { method: 'DELETE' })
+        .then(res => res.json()).then(result => {
+            if (result.success) {
+                showToast('Snapshot deleted');
+                setTimeout(() => location.reload(), 800);
+            } else {
+                showToast('Delete failed', true);
+            }
+        });
+}
+
+function clearHistory() {
+    if (!confirm('Clear all query history?')) return;
+    fetch('/api/query/history', { method: 'DELETE' })
+        .then(res => res.json()).then(() => {
+            showToast('History cleared');
+            setTimeout(() => location.reload(), 800);
+        });
+}
+
 function showToast(message, isError = false) {
     const toast = document.getElementById('toast');
     toast.textContent = message;
@@ -753,13 +978,24 @@ function showToast(message, isError = false) {
     @app.route("/")
     def home():
         query = request.args.get("q", "")
+        sort_mode = request.args.get("sort", "combined")
+        if sort_mode not in ("combined", "title_only", "body_only", "url_only"):
+            sort_mode = "combined"
         results = []
         if query:
-            results_raw = engine.search(query, top_k=20)
+            results_raw = engine.search(query, top_k=20, sort_mode=sort_mode)
             results = _prepare_results(results_raw)
+            _record_query(query, len(results_raw), sort_mode)
 
         overview = _format_overview(engine.index.get_overview())
         snapshots = engine.list_snapshots()
+
+        history_display = []
+        for h in query_history[:10]:
+            h2 = dict(h)
+            ts = h.get("timestamp", time.time())
+            h2["time_str"] = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            history_display.append(h2)
 
         return render_template_string(
             HTML_TEMPLATE,
@@ -767,23 +1003,31 @@ function showToast(message, isError = false) {
             results=results,
             overview=overview,
             snapshots=snapshots,
+            sort_mode=sort_mode,
+            query_history=history_display,
         )
 
     @app.route("/api/search")
     def api_search():
         query = request.args.get("q", "")
         top_k = int(request.args.get("top_k", 10))
-        results = engine.search(query, top_k=top_k)
+        sort_mode = request.args.get("sort", "combined")
+        if sort_mode not in ("combined", "title_only", "body_only", "url_only"):
+            sort_mode = "combined"
+        results = engine.search(query, top_k=top_k, sort_mode=sort_mode)
+        _record_query(query, len(results), sort_mode)
         return jsonify(
             {
                 "query": query,
                 "total": len(results),
+                "sort_mode": sort_mode,
                 "results": [
                     {
                         "doc_id": r.doc_id,
                         "url": r.url,
                         "title": r.title,
                         "score": round(r.score, 4),
+                        "sort_score": round(getattr(r, "sort_score", r.score), 4),
                         "term_freqs": r.term_freqs,
                         "doc_length": r.doc_length,
                         "phrase_matches": len(r.phrase_matches),
@@ -818,6 +1062,38 @@ function showToast(message, isError = false) {
         engine.save_index(INDEX_DIR)
         return jsonify({"status": "ok", "snapshot_id": snap_id})
 
+    @app.route("/api/index/snapshot/<int:snapshot_id>/export")
+    def api_export_snapshot(snapshot_id):
+        import tempfile
+        tmp_path = os.path.join(tempfile.gettempdir(), f"snapshot_{snapshot_id}.json")
+        ok = engine.export_snapshot(snapshot_id, tmp_path)
+        if not ok:
+            return jsonify({"error": "Export failed"}), 404
+        return send_file(tmp_path, as_attachment=True, download_name=f"snapshot_{snapshot_id}.json")
+
+    @app.route("/api/index/snapshot/import", methods=["POST"])
+    def api_import_snapshot():
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        f = request.files["file"]
+        import tempfile
+        tmp_path = os.path.join(tempfile.gettempdir(), f"import_{int(time.time())}.json")
+        f.save(tmp_path)
+        label = request.form.get("label", "")
+        snap_id = engine.import_snapshot(tmp_path, label=label or None)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        if snap_id is None:
+            return jsonify({"error": "Import failed"}), 400
+        return jsonify({"status": "ok", "snapshot_id": snap_id})
+
+    @app.route("/api/index/snapshot/<int:snapshot_id>", methods=["DELETE"])
+    def api_delete_snapshot(snapshot_id):
+        ok = engine.delete_snapshot(snapshot_id)
+        return jsonify({"success": ok})
+
     @app.route("/api/index/rollback", methods=["POST"])
     def api_rollback():
         data = request.get_json() or {}
@@ -830,6 +1106,23 @@ function showToast(message, isError = false) {
     @app.route("/api/index/snapshots")
     def api_list_snapshots():
         return jsonify({"snapshots": engine.list_snapshots()})
+
+    @app.route("/api/query/history")
+    def api_query_history():
+        enhanced = []
+        for h in query_history:
+            h2 = dict(h)
+            ts = h.get("timestamp", time.time())
+            h2["time_str"] = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            enhanced.append(h2)
+        return jsonify({"history": enhanced})
+
+    @app.route("/api/query/history", methods=["DELETE"])
+    def api_clear_history():
+        nonlocal query_history
+        query_history = []
+        save_query_history(query_history)
+        return jsonify({"status": "ok"})
 
     logger.info("Starting web server at http://localhost:%d", args.port)
     app.run(host="0.0.0.0", port=args.port, debug=args.debug)
