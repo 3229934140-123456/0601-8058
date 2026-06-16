@@ -2,11 +2,40 @@ import math
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
-from indexer import InvertedIndex
+from indexer import InvertedIndex, DEFAULT_FIELD_WEIGHTS
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ScoreBreakdown:
+    bm25_body: float = 0.0
+    bm25_title: float = 0.0
+    bm25_url: float = 0.0
+    bm25_total: float = 0.0
+    phrase_boost: float = 0.0
+    proximity_boost: float = 0.0
+    must_boost: float = 0.0
+    total: float = 0.0
+    per_term: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            "bm25_body": round(self.bm25_body, 4),
+            "bm25_title": round(self.bm25_title, 4),
+            "bm25_url": round(self.bm25_url, 4),
+            "bm25_total": round(self.bm25_total, 4),
+            "phrase_boost": round(self.phrase_boost, 4),
+            "proximity_boost": round(self.proximity_boost, 4),
+            "must_boost": round(self.must_boost, 4),
+            "total": round(self.total, 4),
+            "per_term": {
+                t: {k: round(v, 4) for k, v in d.items()}
+                for t, d in self.per_term.items()
+            },
+        }
 
 
 @dataclass
@@ -20,40 +49,67 @@ class SearchResult:
     doc_length: int = 0
     phrase_matches: List = field(default_factory=list)
     highlights: List[str] = field(default_factory=list)
+    field_hits: Dict = field(default_factory=dict)
+    score_breakdown: ScoreBreakdown = field(default_factory=ScoreBreakdown)
 
     def __repr__(self):
         return f"SearchResult(doc_id={self.doc_id}, score={self.score:.4f}, title={self.title!r})"
 
 
-class BM25:
-    def __init__(self, index, k1=1.8, b=0.75, delta=1.0):
+class BM25FieldScorer:
+    def __init__(self, index, field_weights=None, k1=1.8, b=0.75, delta=1.0):
         self.index = index
+        self.field_weights = field_weights or DEFAULT_FIELD_WEIGHTS
         self.k1 = k1
         self.b = b
         self.delta = delta
 
-    def _idf(self, term):
+    def _idf(self, term, field="body"):
         N = self.index.doc_count
-        n = self.index.get_doc_freq(term)
+        n = self.index.get_doc_freq(term, field)
         if n == 0:
             return 0.0
         return math.log((N - n + 0.5) / (n + 0.5) + 1.0)
 
-    def score_term(self, term, doc_id):
-        tf = self.index.get_term_freq(term, doc_id)
+    def score_term_field(self, term, doc_id, field):
+        tf = self.index.get_term_freq(term, doc_id, field)
         if tf == 0:
             return 0.0
-        doc_len = self.index.get_doc_length(doc_id)
-        avgdl = self.index.avg_doc_length
+        doc_len = self.index.get_field_doc_length(doc_id, field)
+        avgdl = self.index.get_field_avg_length(field)
         if avgdl == 0:
             return 0.0
-        idf = self._idf(term)
+        idf = self._idf(term, field)
         numerator = tf * (self.k1 + 1)
         denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / avgdl)
         return idf * (numerator / denominator + self.delta)
 
+    def score_term(self, term, doc_id):
+        total = 0.0
+        per_field = {}
+        for field, weight in self.field_weights.items():
+            score = self.score_term_field(term, doc_id, field)
+            per_field[field] = score
+            total += weight * score
+        return total, per_field
+
     def score_document(self, terms, doc_id):
-        return sum(self.score_term(term, doc_id) for term in terms)
+        total = 0.0
+        breakdown = ScoreBreakdown()
+        for term in terms:
+            term_total, per_field = self.score_term(term, doc_id)
+            total += term_total
+            breakdown.bm25_body += self.field_weights["body"] * per_field["body"]
+            breakdown.bm25_title += self.field_weights["title"] * per_field["title"]
+            breakdown.bm25_url += self.field_weights["url"] * per_field["url"]
+            breakdown.per_term[term] = {
+                "body": self.field_weights["body"] * per_field["body"],
+                "title": self.field_weights["title"] * per_field["title"],
+                "url": self.field_weights["url"] * per_field["url"],
+                "total": term_total,
+            }
+        breakdown.bm25_total = total
+        return total, breakdown
 
 
 @dataclass
@@ -62,6 +118,8 @@ class ParsedQuery:
     should_terms: List[str] = field(default_factory=list)
     exclude_terms: List[str] = field(default_factory=list)
     phrases: List[List[str]] = field(default_factory=list)
+    field_terms: Dict[str, List[str]] = field(default_factory=dict)
+    site_terms: List[str] = field(default_factory=list)
 
 
 class QueryParser:
@@ -73,41 +131,56 @@ class QueryParser:
         must_terms = []
         should_terms = []
         exclude_terms = []
+        field_terms = {"title": [], "url": [], "body": []}
+        site_terms = []
 
         phrases = self.tokenizer.extract_phrases(query_string)
         remaining = self.tokenizer.remove_phrases(query_string)
 
-        raw_tokens = remaining.split()
-        for token in raw_tokens:
-            if token.startswith("+"):
-                term = token[1:].strip()
-                if term:
-                    tokenized = self.tokenizer.tokenize_query(term)
+        raw_parts = remaining.split()
+        for part in raw_parts:
+            if not part:
+                continue
+
+            field_match = re.match(r'(title|url|site|body):(.+)', part)
+            if field_match:
+                field_name = field_match.group(1)
+                field_value = field_match.group(2)
+                tokens = self.tokenizer.tokenize_query(field_value)
+                if field_name == "site":
+                    site_terms.extend(tokens)
+                elif field_name in field_terms:
+                    field_terms[field_name].extend(tokens)
+                continue
+
+            if part.startswith("+"):
+                term_str = part[1:]
+                if term_str:
+                    tokenized = self.tokenizer.tokenize_query(term_str)
                     must_terms.extend(tokenized)
-            elif token.startswith("-"):
-                term = token[1:].strip()
-                if term:
-                    tokenized = self.tokenizer.tokenize_query(term)
+            elif part.startswith("-"):
+                term_str = part[1:]
+                if term_str:
+                    tokenized = self.tokenizer.tokenize_query(term_str)
                     exclude_terms.extend(tokenized)
             else:
-                term = token.strip()
-                if term:
-                    tokenized = self.tokenizer.tokenize_query(term)
-                    should_terms.extend(tokenized)
+                tokenized = self.tokenizer.tokenize_query(part)
+                should_terms.extend(tokenized)
 
-        phrase_must = []
         for phrase in phrases:
-            phrase_must.extend(phrase)
+            must_terms.extend(phrase)
 
         return ParsedQuery(
             must_terms=must_terms,
             should_terms=should_terms,
             exclude_terms=exclude_terms,
             phrases=phrases,
+            field_terms=field_terms,
+            site_terms=site_terms,
         )
 
 
-def _extract_snippets(text, terms, window_size=30, max_snippets=3):
+def _extract_snippets(text, terms, window_size=40, max_snippets=3):
     text_lower = text.lower()
     snippets = []
     found_positions = []
@@ -124,8 +197,8 @@ def _extract_snippets(text, terms, window_size=30, max_snippets=3):
 
     if not found_positions:
         cleaned = re.sub(r'\s+', ' ', text)
-        if len(cleaned) > 200:
-            snippets.append(cleaned[:200] + "...")
+        if len(cleaned) > 250:
+            snippets.append(cleaned[:250] + "...")
         else:
             snippets.append(cleaned)
         return snippets
@@ -197,16 +270,16 @@ def _proximity_score(positions_map, max_distance=8):
                 pair_count += 1
 
     if pair_count > 0:
-        return total_bonus / pair_count
+        return total_bonus / pair_count * 3.0
     return 0.0
 
 
 class SearchEngine:
-    def __init__(self, index=None, bm25=None, tokenizer=None):
+    def __init__(self, index=None, scorer=None, tokenizer=None):
         from tokenizer import Tokenizer
         self.tokenizer = tokenizer or Tokenizer()
         self.index = index or InvertedIndex(tokenizer=self.tokenizer)
-        self.bm25 = bm25 or BM25(self.index)
+        self.scorer = scorer or BM25FieldScorer(self.index)
         self.query_parser = QueryParser(tokenizer=self.tokenizer)
 
     def search(self, query_string, top_k=10):
@@ -216,36 +289,67 @@ class SearchEngine:
         should_terms = list(dict.fromkeys(parsed.should_terms))
         exclude_terms = list(dict.fromkeys(parsed.exclude_terms))
         phrases = parsed.phrases
+        field_terms = parsed.field_terms
+        site_terms = parsed.site_terms
 
         all_terms = list(dict.fromkeys(must_terms + should_terms))
         for phrase in phrases:
             for t in phrase:
                 if t not in all_terms:
                     all_terms.append(t)
+        for field, terms in field_terms.items():
+            for t in terms:
+                if t not in all_terms:
+                    all_terms.append(t)
 
-        if not all_terms and not phrases:
+        if not all_terms and not site_terms:
             return []
 
         candidate_docs = set()
 
+        if site_terms:
+            site_docs = self.index.site_filter(site_terms)
+            candidate_docs.update(site_docs)
+
         if must_terms:
-            candidate_docs = self.index.intersect_postings(must_terms)
+            must_docs = self.index.intersect_postings(must_terms, field="body")
+            for field, terms in field_terms.items():
+                if terms:
+                    field_docs = self.index.intersect_postings(terms, field=field)
+                    must_docs = must_docs & field_docs if must_docs else field_docs
+            if candidate_docs:
+                candidate_docs = candidate_docs & must_docs
+            else:
+                candidate_docs = must_docs
         elif should_terms:
-            candidate_docs = self.index.union_postings(should_terms)
+            should_docs = self.index.union_postings(should_terms, field="body")
+            for field, terms in field_terms.items():
+                if terms:
+                    field_docs = self.index.union_postings(terms, field=field)
+                    should_docs = should_docs | field_docs
+            if candidate_docs:
+                candidate_docs = candidate_docs & should_docs
+            else:
+                candidate_docs = should_docs
         elif phrases:
             for phrase in phrases:
-                phrase_docs = self.index.intersect_postings(phrase)
+                phrase_docs = self.index.intersect_postings(phrase, field="body")
                 candidate_docs.update(phrase_docs)
-
-        for phrase in phrases:
-            phrase_docs = self.index.intersect_postings(phrase)
-            if must_terms or should_terms:
-                candidate_docs = candidate_docs & phrase_docs if candidate_docs else phrase_docs
-            else:
-                candidate_docs = candidate_docs | phrase_docs
+        else:
+            has_field_terms = any(terms for terms in field_terms.values())
+            if has_field_terms:
+                field_candidates = set()
+                for field, terms in field_terms.items():
+                    if terms:
+                        field_docs = self.index.union_postings(terms, field=field)
+                        field_candidates.update(field_docs)
+                if candidate_docs:
+                    candidate_docs = candidate_docs & field_candidates
+                else:
+                    candidate_docs = field_candidates
 
         if exclude_terms:
-            exclude_docs = self.index.union_postings(exclude_terms)
+            exclude_docs = self.index.union_postings(exclude_terms, field="body")
             candidate_docs = candidate_docs - exclude_docs
 
         results = []
@@ -254,41 +358,60 @@ class SearchEngine:
             if not doc:
                 continue
 
-            base_score = 0.0
-            term_freqs = {}
-            positions_map = {}
+            base_score, breakdown = self.scorer.score_document(all_terms, doc_id)
 
-            for term in all_terms:
-                tf = self.index.get_term_freq(term, doc_id)
-                if tf > 0:
-                    term_score = self.bm25.score_term(term, doc_id)
-                    if term in must_terms:
-                        term_score *= 2.5
-                    base_score += term_score
-                    term_freqs[term] = tf
-                    positions_map[term] = self.index.get_positions(term, doc_id)
+            must_boost = 0.0
+            for term in must_terms:
+                term_score = breakdown.per_term.get(term, {}).get("total", 0)
+                must_boost += term_score * 1.5
+            breakdown.must_boost = must_boost
 
             phrase_score = 0.0
             phrase_matches = []
             for phrase in phrases:
-                found, matches = self.index.check_phrase(phrase, doc_id)
+                found, matches = self.index.check_phrase(phrase, doc_id, field="body")
                 if found:
-                    phrase_score += len(matches) * 5.0
+                    phrase_score += len(matches) * 6.0
                     phrase_matches.extend(matches)
                     for t in phrase:
-                        if t not in term_freqs:
-                            term_freqs[t] = self.index.get_term_freq(t, doc_id)
+                        if t not in breakdown.per_term:
+                            tf = self.index.get_term_freq(t, doc_id, "body")
+                            breakdown.per_term[t] = {
+                                "body": 0,
+                                "title": 0,
+                                "url": 0,
+                                "total": 0,
+                                "tf": tf,
+                            }
+            breakdown.phrase_boost = phrase_score
 
-            proximity_bonus = _proximity_score(positions_map)
-            rare_term_bonus = 0.0
+            positions_map = {}
             for term in all_terms:
-                if term in term_freqs:
-                    df = self.index.get_doc_freq(term)
-                    if df > 0:
-                        idf_component = math.log((self.index.doc_count + 1) / (df + 1))
-                        rare_term_bonus += idf_component * 0.1
+                positions = self.index.get_positions(term, doc_id, field="body")
+                if positions:
+                    positions_map[term] = positions
+            proximity_bonus = _proximity_score(positions_map)
+            breakdown.proximity_boost = proximity_bonus
 
-            total_score = base_score + phrase_score + proximity_bonus + rare_term_bonus
+            field_hit_info = {}
+            for field in ["title", "body", "url"]:
+                field_hit_terms = []
+                for term in all_terms:
+                    if self.index.get_term_freq(term, doc_id, field) > 0:
+                        field_hit_terms.append(term)
+                if field_hit_terms:
+                    field_hit_info[field] = field_hit_terms
+
+            total_score = base_score + phrase_score + proximity_bonus + must_boost
+            breakdown.total = total_score
+
+            term_freqs = {}
+            for term in all_terms:
+                tf = self.index.get_term_freq(term, doc_id, "body")
+                ttf = self.index.get_term_freq(term, doc_id, "title")
+                utf = self.index.get_term_freq(term, doc_id, "url")
+                if tf > 0 or ttf > 0 or utf > 0:
+                    term_freqs[term] = {"body": tf, "title": ttf, "url": utf}
 
             if total_score > 0:
                 snippets = {}
@@ -310,6 +433,8 @@ class SearchEngine:
                         doc_length=doc.length,
                         phrase_matches=phrase_matches,
                         highlights=highlights,
+                        field_hits=field_hit_info,
+                        score_breakdown=breakdown,
                     )
                 )
 
@@ -323,9 +448,18 @@ class SearchEngine:
     def add_documents_batch(self, pages):
         return self.index.add_documents_batch(pages)
 
+    def create_snapshot(self, label=""):
+        return self.index.create_snapshot(label)
+
+    def rollback_snapshot(self, snapshot_id):
+        return self.index.rollback_snapshot(snapshot_id)
+
+    def list_snapshots(self):
+        return self.index.list_snapshots()
+
     def save_index(self, directory):
         self.index.save(directory)
 
     def load_index(self, directory):
         self.index.load(directory)
-        self.bm25 = BM25(self.index)
+        self.scorer = BM25FieldScorer(self.index)

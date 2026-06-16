@@ -2,6 +2,7 @@ import json
 import os
 import hashlib
 import time
+import copy
 import logging
 from collections import defaultdict, Counter
 
@@ -9,11 +10,32 @@ from tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FIELD_WEIGHTS = {
+    "title": 3.0,
+    "body": 1.0,
+    "url": 2.0,
+}
+
 
 class Document:
-    __slots__ = ("doc_id", "url", "title", "text", "length", "content_hash", "updated_at", "term_freq")
+    __slots__ = (
+        "doc_id", "url", "title", "text",
+        "length", "content_hash", "updated_at",
+        "field_lengths", "field_term_freq",
+    )
 
-    def __init__(self, doc_id, url, title, text, length, content_hash, updated_at=None, term_freq=None):
+    def __init__(
+        self,
+        doc_id,
+        url,
+        title,
+        text,
+        length,
+        content_hash,
+        updated_at=None,
+        field_lengths=None,
+        field_term_freq=None,
+    ):
         self.doc_id = doc_id
         self.url = url
         self.title = title
@@ -21,7 +43,8 @@ class Document:
         self.length = length
         self.content_hash = content_hash
         self.updated_at = updated_at if updated_at is not None else time.time()
-        self.term_freq = term_freq if term_freq is not None else {}
+        self.field_lengths = field_lengths or {"title": 0, "body": 0, "url": 0}
+        self.field_term_freq = field_term_freq or {"title": {}, "body": {}, "url": {}}
 
     def to_dict(self):
         return {
@@ -32,7 +55,8 @@ class Document:
             "length": self.length,
             "content_hash": self.content_hash,
             "updated_at": self.updated_at,
-            "term_freq": self.term_freq,
+            "field_lengths": self.field_lengths,
+            "field_term_freq": self.field_term_freq,
         }
 
     @classmethod
@@ -45,7 +69,8 @@ class Document:
             d["length"],
             d.get("content_hash", ""),
             d.get("updated_at", time.time()),
-            d.get("term_freq", {}),
+            d.get("field_lengths", {"title": 0, "body": 0, "url": 0}),
+            d.get("field_term_freq", {"title": {}, "body": {}, "url": {}}),
         )
 
 
@@ -56,13 +81,19 @@ def _content_hash(text):
 class InvertedIndex:
     def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer or Tokenizer()
-        self.postings = defaultdict(lambda: defaultdict(list))
+        self.field_postings = {
+            "title": defaultdict(lambda: defaultdict(list)),
+            "body": defaultdict(lambda: defaultdict(list)),
+            "url": defaultdict(lambda: defaultdict(list)),
+        }
         self.documents = {}
         self._next_id = 0
         self._url_to_id = {}
-        self._total_length = 0
+        self._field_total_length = {"title": 0, "body": 0, "url": 0}
         self._corpus_length = 0
         self._last_updated = time.time()
+        self._snapshots = []
+        self._snapshot_dir = None
 
     @property
     def doc_count(self):
@@ -70,34 +101,55 @@ class InvertedIndex:
 
     @property
     def term_count(self):
-        return len(self.postings)
+        all_terms = set()
+        for field in self.field_postings:
+            all_terms.update(self.field_postings[field].keys())
+        return len(all_terms)
 
     @property
     def avg_doc_length(self):
         if self.doc_count == 0:
             return 0
-        return self._total_length / self.doc_count
+        return self._field_total_length["body"] / self.doc_count
 
     @property
     def last_updated(self):
         return self._last_updated
 
-    def get_term_freq(self, term, doc_id):
-        positions = self.postings.get(term, {}).get(doc_id, [])
+    def get_field_avg_length(self, field):
+        if self.doc_count == 0:
+            return 0
+        return self._field_total_length.get(field, 0) / self.doc_count
+
+    def get_term_freq(self, term, doc_id, field="body"):
+        positions = self.field_postings[field].get(term, {}).get(doc_id, [])
         return len(positions)
 
-    def get_doc_freq(self, term):
-        return len(self.postings.get(term, {}))
+    def get_doc_freq(self, term, field="body"):
+        return len(self.field_postings[field].get(term, {}))
 
     def get_doc_length(self, doc_id):
         doc = self.documents.get(doc_id)
         return doc.length if doc else 0
+
+    def get_field_doc_length(self, doc_id, field):
+        doc = self.documents.get(doc_id)
+        if doc is None:
+            return 0
+        return doc.field_lengths.get(field, 0)
 
     def get_content_hash(self, url):
         doc_id = self._url_to_id.get(url)
         if doc_id is None:
             return None
         return self.documents[doc_id].content_hash
+
+    def _tokenize_field(self, text, field_name):
+        tokens = self.tokenizer.tokenize(text)
+        term_freq = Counter()
+        for term, pos in tokens:
+            term_freq[term] += 1
+        return tokens, dict(term_freq), len(tokens)
 
     def add_document(self, url, title, text):
         content_hash = _content_hash(text)
@@ -118,33 +170,44 @@ class InvertedIndex:
         doc_id = self._next_id
         self._next_id += 1
 
-        tokens, original_tokens = self.tokenizer.tokenize_with_original(text)
-        doc_length = len(tokens)
+        body_tokens, body_tf, body_len = self._tokenize_field(text, "body")
+        title_tokens, title_tf, title_len = self._tokenize_field(title, "title")
+        url_tokens, url_tf, url_len = self._tokenize_field(url, "url")
 
-        term_freq = Counter()
-        for term, position in tokens:
-            self.postings[term][doc_id].append(position)
-            term_freq[term] += 1
+        for term, position in body_tokens:
+            self.field_postings["body"][term][doc_id].append(position)
+        for term, position in title_tokens:
+            self.field_postings["title"][term][doc_id].append(position)
+        for term, position in url_tokens:
+            self.field_postings["url"][term][doc_id].append(position)
+
+        total_length = body_len
+
+        field_lengths = {"title": title_len, "body": body_len, "url": url_len}
+        field_term_freq = {"title": title_tf, "body": body_tf, "url": url_tf}
 
         doc = Document(
             doc_id=doc_id,
             url=url,
             title=title,
             text=text,
-            length=doc_length,
+            length=total_length,
             content_hash=content_hash,
-            term_freq=dict(term_freq),
+            field_lengths=field_lengths,
+            field_term_freq=field_term_freq,
         )
         self.documents[doc_id] = doc
         self._url_to_id[url] = doc_id
-        self._total_length += doc_length
+        self._field_total_length["title"] += title_len
+        self._field_total_length["body"] += body_len
+        self._field_total_length["url"] += url_len
         self._corpus_length += 1
         self._last_updated = time.time()
 
-        unique_terms = sum(1 for t in term_freq)
+        unique_body_terms = len(body_tf)
         logger.info(
-            "Indexed doc %d: %s (%d tokens, %d unique terms, action=%s)",
-            doc_id, title[:30], doc_length, unique_terms, action,
+            "Indexed doc %d: %s (body=%d tokens/%d unique, action=%s)",
+            doc_id, title[:30], body_len, unique_body_terms, action,
         )
         return doc_id, action
 
@@ -152,17 +215,20 @@ class InvertedIndex:
         if doc_id not in self.documents:
             return
         doc = self.documents[doc_id]
-        terms_to_remove = []
-        for term, doc_postings in self.postings.items():
-            if doc_id in doc_postings:
-                del doc_postings[doc_id]
-                if not doc_postings:
-                    terms_to_remove.append(term)
 
-        for term in terms_to_remove:
-            del self.postings[term]
+        for field in self.field_postings:
+            terms_to_remove = []
+            for term, doc_postings in self.field_postings[field].items():
+                if doc_id in doc_postings:
+                    del doc_postings[doc_id]
+                    if not doc_postings:
+                        terms_to_remove.append(term)
+            for term in terms_to_remove:
+                del self.field_postings[field][term]
 
-        self._total_length -= doc.length
+        self._field_total_length["title"] -= doc.field_lengths.get("title", 0)
+        self._field_total_length["body"] -= doc.field_lengths.get("body", 0)
+        self._field_total_length["url"] -= doc.field_lengths.get("url", 0)
         self._corpus_length -= 1
         if doc.url in self._url_to_id:
             del self._url_to_id[doc.url]
@@ -183,12 +249,12 @@ class InvertedIndex:
         )
         return doc_ids, stats
 
-    def intersect_postings(self, terms):
+    def intersect_postings(self, terms, field="body"):
         if not terms:
             return set()
         posting_sets = []
         for term in terms:
-            doc_ids = set(self.postings.get(term, {}).keys())
+            doc_ids = set(self.field_postings[field].get(term, {}).keys())
             if not doc_ids:
                 return set()
             posting_sets.append(doc_ids)
@@ -200,28 +266,27 @@ class InvertedIndex:
                 return set()
         return result
 
-    def union_postings(self, terms):
+    def union_postings(self, terms, field="body"):
         result = set()
         for term in terms:
-            doc_ids = self.postings.get(term, {}).keys()
+            doc_ids = self.field_postings[field].get(term, {}).keys()
             result.update(doc_ids)
         return result
 
-    def get_positions(self, term, doc_id):
-        return self.postings.get(term, {}).get(doc_id, [])
+    def get_positions(self, term, doc_id, field="body"):
+        return self.field_postings[field].get(term, {}).get(doc_id, [])
 
-    def check_phrase(self, phrase_tokens, doc_id):
+    def check_phrase(self, phrase_tokens, doc_id, field="body"):
         if not phrase_tokens:
             return False, []
         positions_list = []
         for term in phrase_tokens:
-            positions = self.get_positions(term, doc_id)
+            positions = self.get_positions(term, doc_id, field)
             if not positions:
                 return False, []
             positions_list.append(positions)
 
         matches = []
-        first_term = phrase_tokens[0]
         for start_pos in positions_list[0]:
             match = True
             phrase_positions = [start_pos]
@@ -236,22 +301,103 @@ class InvertedIndex:
 
         return len(matches) > 0, matches
 
+    def site_filter(self, site_terms, doc_ids=None):
+        if not site_terms:
+            return doc_ids if doc_ids is not None else set()
+
+        url_docs = self.union_postings(site_terms, field="url")
+
+        if doc_ids is None:
+            return url_docs
+        return doc_ids & url_docs
+
+    def create_snapshot(self, label=""):
+        snapshot = {
+            "id": len(self._snapshots),
+            "timestamp": time.time(),
+            "label": label,
+            "doc_count": self.doc_count,
+            "term_count": self.term_count,
+            "data": {
+                "field_postings": copy.deepcopy(dict(self.field_postings)),
+                "documents": {k: v.to_dict() for k, v in self.documents.items()},
+                "next_id": self._next_id,
+                "url_to_id": dict(self._url_to_id),
+                "field_total_length": dict(self._field_total_length),
+                "corpus_length": self._corpus_length,
+                "last_updated": self._last_updated,
+            },
+        }
+        self._snapshots.append(snapshot)
+        logger.info("Created snapshot %d: %s (%d docs)", snapshot["id"], label or "auto", self.doc_count)
+        return snapshot["id"]
+
+    def rollback_snapshot(self, snapshot_id):
+        if snapshot_id < 0 or snapshot_id >= len(self._snapshots):
+            return False
+
+        snap = self._snapshots[snapshot_id]
+        data = snap["data"]
+
+        self.field_postings = {}
+        for field, postings in data["field_postings"].items():
+            self.field_postings[field] = defaultdict(lambda: defaultdict(list))
+            for term, doc_map in postings.items():
+                for doc_id, positions in doc_map.items():
+                    self.field_postings[field][term][int(doc_id)] = list(positions)
+
+        self.documents = {}
+        for doc_id_str, doc_dict in data["documents"].items():
+            self.documents[int(doc_id_str)] = Document.from_dict(doc_dict)
+
+        self._next_id = data["next_id"]
+        self._url_to_id = dict(data["url_to_id"])
+        self._field_total_length = dict(data["field_total_length"])
+        self._corpus_length = data["corpus_length"]
+        self._last_updated = data["last_updated"]
+
+        self._snapshots = self._snapshots[:snapshot_id]
+
+        logger.info(
+            "Rolled back to snapshot %d (%s), %d docs",
+            snapshot_id, snap["label"] or "auto", self.doc_count,
+        )
+        return True
+
+    def list_snapshots(self):
+        return [
+            {
+                "id": s["id"],
+                "timestamp": s["timestamp"],
+                "label": s["label"],
+                "doc_count": s["doc_count"],
+                "term_count": s["term_count"],
+            }
+            for s in self._snapshots
+        ]
+
     def get_overview(self):
         return {
             "doc_count": self.doc_count,
             "term_count": self.term_count,
             "avg_doc_length": round(self.avg_doc_length, 2),
             "last_updated": self._last_updated,
-            "total_tokens": self._total_length,
+            "total_tokens_body": self._field_total_length["body"],
+            "total_tokens_title": self._field_total_length["title"],
+            "total_tokens_url": self._field_total_length["url"],
+            "snapshot_count": len(self._snapshots),
         }
 
     def save(self, directory):
         os.makedirs(directory, exist_ok=True)
+
         postings_serializable = {}
-        for term, doc_map in self.postings.items():
-            postings_serializable[term] = {
-                str(doc_id): positions for doc_id, positions in doc_map.items()
-            }
+        for field, postings in self.field_postings.items():
+            postings_serializable[field] = {}
+            for term, doc_map in postings.items():
+                postings_serializable[field][term] = {
+                    str(doc_id): positions for doc_id, positions in doc_map.items()
+                }
         with open(os.path.join(directory, "postings.json"), "w", encoding="utf-8") as f:
             json.dump(postings_serializable, f, ensure_ascii=False)
 
@@ -263,7 +409,7 @@ class InvertedIndex:
 
         meta = {
             "next_id": self._next_id,
-            "total_length": self._total_length,
+            "field_total_length": self._field_total_length,
             "corpus_length": self._corpus_length,
             "url_to_id": self._url_to_id,
             "last_updated": self._last_updated,
@@ -271,13 +417,15 @@ class InvertedIndex:
         with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False)
 
-        logger.info("Index saved to %s (%d docs, %d terms)", directory, self.doc_count, len(self.postings))
+        logger.info("Index saved to %s (%d docs, %d terms)", directory, self.doc_count, self.term_count)
 
     def load(self, directory):
         with open(os.path.join(directory, "meta.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
         self._next_id = meta["next_id"]
-        self._total_length = meta["total_length"]
+        self._field_total_length = meta.get(
+            "field_total_length", {"title": 0, "body": 0, "url": 0}
+        )
         self._corpus_length = meta["corpus_length"]
         self._url_to_id = meta["url_to_id"]
         self._last_updated = meta.get("last_updated", time.time())
@@ -290,9 +438,25 @@ class InvertedIndex:
 
         with open(os.path.join(directory, "postings.json"), "r", encoding="utf-8") as f:
             postings_data = json.load(f)
-        self.postings = defaultdict(lambda: defaultdict(list))
-        for term, doc_map in postings_data.items():
-            for doc_id_str, positions in doc_map.items():
-                self.postings[term][int(doc_id_str)] = positions
 
-        logger.info("Index loaded from %s (%d docs, %d terms)", directory, self.doc_count, len(self.postings))
+        if isinstance(next(iter(postings_data.values())) if postings_data else {}, dict):
+            self.field_postings = {}
+            for field in ["title", "body", "url"]:
+                self.field_postings[field] = defaultdict(lambda: defaultdict(list))
+            for field, field_data in postings_data.items():
+                if field not in self.field_postings:
+                    continue
+                for term, doc_map in field_data.items():
+                    for doc_id_str, positions in doc_map.items():
+                        self.field_postings[field][term][int(doc_id_str)] = positions
+        else:
+            self.field_postings = {
+                "title": defaultdict(lambda: defaultdict(list)),
+                "body": defaultdict(lambda: defaultdict(list)),
+                "url": defaultdict(lambda: defaultdict(list)),
+            }
+            for term, doc_map in postings_data.items():
+                for doc_id_str, positions in doc_map.items():
+                    self.field_postings["body"][term][int(doc_id_str)] = positions
+
+        logger.info("Index loaded from %s (%d docs, %d terms)", directory, self.doc_count, self.term_count)

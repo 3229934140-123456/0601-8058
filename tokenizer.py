@@ -34,8 +34,25 @@ STOP_WORDS_ZH = {
 
 STOP_WORDS = STOP_WORDS_EN | STOP_WORDS_ZH
 
+_PUNCT_RE = re.compile(
+    r"^[\W_]+$",
+    re.UNICODE,
+)
+
 _EN_WORD_RE = re.compile(r"[a-zA-Z0-9]+(?:['_-][a-zA-Z0-9]+)*")
 _PHRASE_RE = re.compile(r'"([^"]+)"')
+_FIELD_RE = re.compile(r'(title|url|site|body):(\S+)')
+
+
+def _is_punctuation(s):
+    if not s:
+        return True
+    s = s.strip()
+    if not s:
+        return True
+    if len(s) == 1 and not s.isalnum():
+        return True
+    return bool(_PUNCT_RE.match(s))
 
 
 class Tokenizer:
@@ -47,6 +64,8 @@ class Tokenizer:
     def _process_token(self, seg):
         seg = seg.strip()
         if not seg:
+            return None
+        if _is_punctuation(seg):
             return None
         term = seg.lower()
         if len(term) < self.min_len:
@@ -100,8 +119,6 @@ class Tokenizer:
 
     def tokenize_query(self, query):
         tokens = []
-        position = 0
-
         for seg in jieba.cut(query):
             en_matches = _EN_WORD_RE.findall(seg)
             if en_matches:
@@ -109,13 +126,10 @@ class Tokenizer:
                     term = self._process_token(word)
                     if term is not None:
                         tokens.append(term)
-                        position += 1
             else:
                 term = self._process_token(seg)
                 if term is not None:
                     tokens.append(term)
-                    position += 1
-
         return tokens
 
     def count_term_freq(self, text):
@@ -136,3 +150,21 @@ class Tokenizer:
 
     def remove_phrases(self, query_string):
         return _PHRASE_RE.sub("", query_string).strip()
+
+    def parse_field_query(self, query_string):
+        field_terms = {"title": [], "url": [], "site": [], "body": []}
+        remaining = []
+
+        parts = query_string.split()
+        for part in parts:
+            match = _FIELD_RE.match(part)
+            if match:
+                field = match.group(1)
+                value = match.group(2)
+                tokens = self.tokenize_query(value)
+                field_terms[field].extend(tokens)
+            else:
+                remaining.append(part)
+
+        remaining_text = " ".join(remaining)
+        return field_terms, remaining_text
