@@ -1,6 +1,8 @@
 import re
 import hashlib
 import time
+import json
+import os
 import logging
 from collections import deque
 from urllib.parse import urlparse, urljoin, urldefrag
@@ -13,15 +15,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-class CrawlResult:
-    __slots__ = ("url", "title", "text", "links", "depth")
+def _content_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def __init__(self, url, title, text, links, depth):
+
+class CrawlResult:
+    __slots__ = ("url", "title", "text", "links", "depth", "content_hash", "status")
+
+    def __init__(self, url, title, text, links, depth, content_hash=None, status="new"):
         self.url = url
         self.title = title
         self.text = text
         self.links = links
         self.depth = depth
+        self.content_hash = content_hash or _content_hash(text)
+        self.status = status
 
     def to_dict(self):
         return {
@@ -30,7 +38,21 @@ class CrawlResult:
             "text": self.text,
             "links": self.links,
             "depth": self.depth,
+            "content_hash": self.content_hash,
+            "status": self.status,
         }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d["url"],
+            d["title"],
+            d["text"],
+            d.get("links", []),
+            d.get("depth", 0),
+            d.get("content_hash"),
+            d.get("status", "new"),
+        )
 
 
 def _normalize_url(url):
@@ -65,6 +87,7 @@ class Crawler:
         delay=1.0,
         timeout=10,
         user_agent="MiniSearchBot/1.0",
+        cache_file=None,
     ):
         self.max_depth = max_depth
         self.max_pages = max_pages
@@ -72,8 +95,10 @@ class Crawler:
         self.delay = delay
         self.timeout = timeout
         self.user_agent = user_agent
+        self.cache_file = cache_file
 
         self._visited = {}
+        self._known_content_hashes = {}
         self._domain_last_access = {}
         self._domain_count = {}
         self._robots_cache = {}
@@ -85,6 +110,33 @@ class Crawler:
         self._session.headers.update(
             {"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
         )
+
+        if cache_file and os.path.exists(cache_file):
+            self._load_cache()
+
+    def _load_cache(self):
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._known_content_hashes = data.get("content_hashes", {})
+            logger.info("Loaded crawl cache: %d known URLs", len(self._known_content_hashes))
+        except Exception as e:
+            logger.warning("Failed to load crawl cache: %s", e)
+
+    def _save_cache(self):
+        if not self.cache_file:
+            return
+        try:
+            data = {
+                "content_hashes": self._known_content_hashes,
+                "saved_at": time.time(),
+            }
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            logger.info("Saved crawl cache: %d known URLs", len(self._known_content_hashes))
+        except Exception as e:
+            logger.warning("Failed to save crawl cache: %s", e)
 
     def _can_fetch(self, url):
         parsed = urlparse(url)
@@ -152,6 +204,14 @@ class Crawler:
             logger.warning("Fetch failed %s: %s", url, e)
             return None
 
+    def _check_change(self, url, new_hash):
+        old_hash = self._known_content_hashes.get(url)
+        if old_hash is None:
+            return "new"
+        if old_hash == new_hash:
+            return "unchanged"
+        return "changed"
+
     def crawl(self, seed_urls):
         results = []
         queue = deque()
@@ -162,6 +222,7 @@ class Crawler:
                 self._visited[fp] = norm
                 queue.append((norm, 0))
 
+        stats = {"new": 0, "updated": 0, "unchanged": 0, "failed": 0}
         page_count = 0
         while queue and page_count < self.max_pages:
             url, depth = queue.popleft()
@@ -178,18 +239,44 @@ class Crawler:
 
             html = self.fetch(url)
             if html is None:
+                stats["failed"] += 1
                 continue
 
             soup = BeautifulSoup(html, "html.parser")
             title, text = self._extract_content(soup)
             if len(text) < 50:
+                stats["failed"] += 1
+                continue
+
+            content_hash = _content_hash(text)
+            change_status = self._check_change(url, content_hash)
+
+            if change_status == "unchanged":
+                stats["unchanged"] += 1
+                logger.info("  -> unchanged, skipping")
+                links = self._extract_links(soup, url)
+                if depth < self.max_depth:
+                    for link in links:
+                        norm_link = _normalize_url(link)
+                        fp = _url_fingerprint(norm_link)
+                        if fp not in self._visited:
+                            self._visited[fp] = norm_link
+                            queue.append((norm_link, depth + 1))
                 continue
 
             links = self._extract_links(soup, url)
-            result = CrawlResult(url, title, text, links, depth)
+            result = CrawlResult(url, title, text, links, depth, content_hash, change_status)
             results.append(result)
             page_count += 1
             self._domain_count[domain] = domain_count + 1
+            self._known_content_hashes[url] = content_hash
+
+            if change_status == "new":
+                stats["new"] += 1
+                logger.info("  -> new page")
+            else:
+                stats["updated"] += 1
+                logger.info("  -> content changed, updating")
 
             if depth < self.max_depth:
                 for link in links:
@@ -199,5 +286,9 @@ class Crawler:
                         self._visited[fp] = norm_link
                         queue.append((norm_link, depth + 1))
 
-        logger.info("Crawl finished: %d pages fetched", len(results))
-        return results
+        self._save_cache()
+        logger.info(
+            "Crawl finished: new=%d, updated=%d, unchanged=%d, failed=%d, total=%d",
+            stats["new"], stats["updated"], stats["unchanged"], stats["failed"], len(results),
+        )
+        return results, stats

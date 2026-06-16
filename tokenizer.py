@@ -1,6 +1,6 @@
 import re
-import math
 import logging
+from collections import Counter
 
 import jieba
 
@@ -34,7 +34,8 @@ STOP_WORDS_ZH = {
 
 STOP_WORDS = STOP_WORDS_EN | STOP_WORDS_ZH
 
-_EN_WORD_RE = re.compile(r"[a-zA-Z0-9]+")
+_EN_WORD_RE = re.compile(r"[a-zA-Z0-9]+(?:['_-][a-zA-Z0-9]+)*")
+_PHRASE_RE = re.compile(r'"([^"]+)"')
 
 
 class Tokenizer:
@@ -43,77 +44,95 @@ class Tokenizer:
         self.min_len = min_len
         jieba.setLogLevel(logging.WARNING)
 
+    def _process_token(self, seg):
+        seg = seg.strip()
+        if not seg:
+            return None
+        term = seg.lower()
+        if len(term) < self.min_len:
+            return None
+        if self.use_stop_words and term in STOP_WORDS:
+            return None
+        return term
+
     def tokenize(self, text):
         tokens = []
         position = 0
-        chunks = _EN_WORD_RE.split(text)
-        for chunk in chunks:
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            segs = jieba.cut(chunk)
-            for seg in segs:
-                seg = seg.strip()
-                if not seg:
-                    continue
-                term = seg.lower()
-                if len(term) < self.min_len:
-                    continue
-                if self.use_stop_words and term in STOP_WORDS:
-                    continue
-                tokens.append((term, position))
-                position += 1
-        en_matches = _EN_WORD_RE.findall(text)
-        for word in en_matches:
-            term = word.lower()
-            if len(term) < self.min_len:
-                continue
-            if self.use_stop_words and term in STOP_WORDS:
-                continue
-            tokens.append((term, position))
-            position += 1
 
-        seen = {}
-        deduped = []
-        for term, pos in tokens:
-            if term not in seen:
-                seen[term] = True
-                deduped.append((term, pos))
-        deduped.sort(key=lambda x: x[1])
-        return deduped
+        for seg in jieba.cut(text):
+            en_matches = _EN_WORD_RE.findall(seg)
+            if en_matches:
+                for word in en_matches:
+                    term = self._process_token(word)
+                    if term is not None:
+                        tokens.append((term, position))
+                        position += 1
+            else:
+                term = self._process_token(seg)
+                if term is not None:
+                    tokens.append((term, position))
+                    position += 1
+
+        return tokens
+
+    def tokenize_with_original(self, text):
+        tokens = []
+        original_tokens = []
+        position = 0
+
+        for seg in jieba.cut(text):
+            en_matches = _EN_WORD_RE.findall(seg)
+            if en_matches:
+                for word in en_matches:
+                    term = self._process_token(word)
+                    if term is not None:
+                        tokens.append((term, position))
+                        original_tokens.append(word)
+                        position += 1
+            else:
+                term = self._process_token(seg)
+                if term is not None:
+                    tokens.append((term, position))
+                    original_tokens.append(seg)
+                    position += 1
+
+        return tokens, original_tokens
 
     def tokenize_query(self, query):
         tokens = []
         position = 0
-        parts = _EN_WORD_RE.split(query)
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            for seg in jieba.cut(part):
-                seg = seg.strip()
-                if not seg:
-                    continue
-                term = seg.lower()
-                if len(term) < self.min_len:
-                    continue
-                if self.use_stop_words and term in STOP_WORDS:
-                    continue
-                tokens.append(term)
-                position += 1
-        for word in _EN_WORD_RE.findall(query):
-            term = word.lower()
-            if len(term) < self.min_len:
-                continue
-            if self.use_stop_words and term in STOP_WORDS:
-                continue
-            tokens.append(term)
-            position += 1
 
-        seen = {}
-        unique = []
-        for t in tokens:
-            if t not in seen:
-                seen[t] = True
-                unique.append(t)
-        return unique
+        for seg in jieba.cut(query):
+            en_matches = _EN_WORD_RE.findall(seg)
+            if en_matches:
+                for word in en_matches:
+                    term = self._process_token(word)
+                    if term is not None:
+                        tokens.append(term)
+                        position += 1
+            else:
+                term = self._process_token(seg)
+                if term is not None:
+                    tokens.append(term)
+                    position += 1
+
+        return tokens
+
+    def count_term_freq(self, text):
+        tokens = self.tokenize(text)
+        counter = Counter()
+        for term, _ in tokens:
+            counter[term] += 1
+        return counter
+
+    def extract_phrases(self, query_string):
+        phrases = _PHRASE_RE.findall(query_string)
+        phrase_tokens_list = []
+        for phrase in phrases:
+            tokens = self.tokenize_query(phrase)
+            if tokens:
+                phrase_tokens_list.append(tokens)
+        return phrase_tokens_list
+
+    def remove_phrases(self, query_string):
+        return _PHRASE_RE.sub("", query_string).strip()

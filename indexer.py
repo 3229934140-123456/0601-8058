@@ -1,7 +1,9 @@
 import json
 import os
+import hashlib
+import time
 import logging
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 from tokenizer import Tokenizer
 
@@ -9,25 +11,46 @@ logger = logging.getLogger(__name__)
 
 
 class Document:
-    __slots__ = ("doc_id", "url", "title", "length")
+    __slots__ = ("doc_id", "url", "title", "text", "length", "content_hash", "updated_at", "term_freq")
 
-    def __init__(self, doc_id, url, title, length):
+    def __init__(self, doc_id, url, title, text, length, content_hash, updated_at=None, term_freq=None):
         self.doc_id = doc_id
         self.url = url
         self.title = title
+        self.text = text
         self.length = length
+        self.content_hash = content_hash
+        self.updated_at = updated_at if updated_at is not None else time.time()
+        self.term_freq = term_freq if term_freq is not None else {}
 
     def to_dict(self):
         return {
             "doc_id": self.doc_id,
             "url": self.url,
             "title": self.title,
+            "text": self.text,
             "length": self.length,
+            "content_hash": self.content_hash,
+            "updated_at": self.updated_at,
+            "term_freq": self.term_freq,
         }
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["doc_id"], d["url"], d["title"], d["length"])
+        return cls(
+            d["doc_id"],
+            d["url"],
+            d["title"],
+            d.get("text", ""),
+            d["length"],
+            d.get("content_hash", ""),
+            d.get("updated_at", time.time()),
+            d.get("term_freq", {}),
+        )
+
+
+def _content_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class InvertedIndex:
@@ -39,16 +62,25 @@ class InvertedIndex:
         self._url_to_id = {}
         self._total_length = 0
         self._corpus_length = 0
+        self._last_updated = time.time()
 
     @property
     def doc_count(self):
         return len(self.documents)
 
     @property
+    def term_count(self):
+        return len(self.postings)
+
+    @property
     def avg_doc_length(self):
         if self.doc_count == 0:
             return 0
         return self._total_length / self.doc_count
+
+    @property
+    def last_updated(self):
+        return self._last_updated
 
     def get_term_freq(self, term, doc_id):
         positions = self.postings.get(term, {}).get(doc_id, [])
@@ -61,29 +93,60 @@ class InvertedIndex:
         doc = self.documents.get(doc_id)
         return doc.length if doc else 0
 
+    def get_content_hash(self, url):
+        doc_id = self._url_to_id.get(url)
+        if doc_id is None:
+            return None
+        return self.documents[doc_id].content_hash
+
     def add_document(self, url, title, text):
-        if url in self._url_to_id:
-            self.remove_document(self._url_to_id[url])
+        content_hash = _content_hash(text)
+        existing_id = self._url_to_id.get(url)
+
+        if existing_id is not None:
+            existing_doc = self.documents[existing_id]
+            if existing_doc.content_hash == content_hash:
+                logger.debug("Document unchanged, skipping: %s", url)
+                return existing_id, "skipped"
+            else:
+                logger.info("Document updated, reindexing: %s", url)
+                self.remove_document(existing_id)
+                action = "updated"
+        else:
+            action = "added"
 
         doc_id = self._next_id
         self._next_id += 1
 
-        tokens = self.tokenizer.tokenize(text)
+        tokens, original_tokens = self.tokenizer.tokenize_with_original(text)
         doc_length = len(tokens)
 
+        term_freq = Counter()
         for term, position in tokens:
             self.postings[term][doc_id].append(position)
+            term_freq[term] += 1
 
-        self.documents[doc_id] = Document(doc_id, url, title, doc_length)
+        doc = Document(
+            doc_id=doc_id,
+            url=url,
+            title=title,
+            text=text,
+            length=doc_length,
+            content_hash=content_hash,
+            term_freq=dict(term_freq),
+        )
+        self.documents[doc_id] = doc
         self._url_to_id[url] = doc_id
         self._total_length += doc_length
         self._corpus_length += 1
+        self._last_updated = time.time()
 
+        unique_terms = sum(1 for t in term_freq)
         logger.info(
-            "Indexed doc %d: %s (%d tokens, %d unique terms)",
-            doc_id, title[:30], doc_length, sum(1 for t in tokens),
+            "Indexed doc %d: %s (%d tokens, %d unique terms, action=%s)",
+            doc_id, title[:30], doc_length, unique_terms, action,
         )
-        return doc_id
+        return doc_id, action
 
     def remove_document(self, doc_id):
         if doc_id not in self.documents:
@@ -104,15 +167,21 @@ class InvertedIndex:
         if doc.url in self._url_to_id:
             del self._url_to_id[doc.url]
         del self.documents[doc_id]
-        logger.info("Removed doc %d from index", doc_id)
+        self._last_updated = time.time()
+        logger.debug("Removed doc %d from index", doc_id)
 
     def add_documents_batch(self, pages):
         doc_ids = []
+        stats = {"added": 0, "updated": 0, "skipped": 0}
         for page in pages:
-            doc_id = self.add_document(page.url, page.title, page.text)
+            doc_id, action = self.add_document(page.url, page.title, page.text)
             doc_ids.append(doc_id)
-        logger.info("Batch indexed %d documents, total: %d", len(doc_ids), self.doc_count)
-        return doc_ids
+            stats[action] = stats.get(action, 0) + 1
+        logger.info(
+            "Batch indexed: added=%d, updated=%d, skipped=%d, total docs=%d",
+            stats["added"], stats["updated"], stats["skipped"], self.doc_count,
+        )
+        return doc_ids, stats
 
     def intersect_postings(self, terms):
         if not terms:
@@ -141,6 +210,41 @@ class InvertedIndex:
     def get_positions(self, term, doc_id):
         return self.postings.get(term, {}).get(doc_id, [])
 
+    def check_phrase(self, phrase_tokens, doc_id):
+        if not phrase_tokens:
+            return False, []
+        positions_list = []
+        for term in phrase_tokens:
+            positions = self.get_positions(term, doc_id)
+            if not positions:
+                return False, []
+            positions_list.append(positions)
+
+        matches = []
+        first_term = phrase_tokens[0]
+        for start_pos in positions_list[0]:
+            match = True
+            phrase_positions = [start_pos]
+            for i in range(1, len(phrase_tokens)):
+                expected = start_pos + i
+                if expected not in positions_list[i]:
+                    match = False
+                    break
+                phrase_positions.append(expected)
+            if match:
+                matches.append(phrase_positions)
+
+        return len(matches) > 0, matches
+
+    def get_overview(self):
+        return {
+            "doc_count": self.doc_count,
+            "term_count": self.term_count,
+            "avg_doc_length": round(self.avg_doc_length, 2),
+            "last_updated": self._last_updated,
+            "total_tokens": self._total_length,
+        }
+
     def save(self, directory):
         os.makedirs(directory, exist_ok=True)
         postings_serializable = {}
@@ -162,6 +266,7 @@ class InvertedIndex:
             "total_length": self._total_length,
             "corpus_length": self._corpus_length,
             "url_to_id": self._url_to_id,
+            "last_updated": self._last_updated,
         }
         with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False)
@@ -175,6 +280,7 @@ class InvertedIndex:
         self._total_length = meta["total_length"]
         self._corpus_length = meta["corpus_length"]
         self._url_to_id = meta["url_to_id"]
+        self._last_updated = meta.get("last_updated", time.time())
 
         with open(os.path.join(directory, "documents.json"), "r", encoding="utf-8") as f:
             docs_data = json.load(f)
